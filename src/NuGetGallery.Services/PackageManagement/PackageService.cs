@@ -6,11 +6,15 @@ using System.Collections.Generic;
 using System.Data.Entity;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using NuGet.Client;
+using NuGet.ContentModel;
 using NuGet.Frameworks;
 using NuGet.Packaging;
 using NuGet.Packaging.Core;
+using NuGet.RuntimeModel;
 using NuGet.Services.Entities;
 using NuGet.Versioning;
 using NuGetGallery.Auditing;
@@ -698,9 +702,85 @@ namespace NuGetGallery
             return package;
         }
 
-        public virtual IEnumerable<NuGetFramework> GetSupportedFrameworks(PackageArchiveReader package)
+        public virtual IEnumerable<NuGetFramework> GetSupportedFrameworks(PackageArchiveReader package) =>
+            GetSupportedFrameworks(package.NuspecReader, package.GetFiles().ToList());
+
+        public virtual IEnumerable<NuGetFramework> GetSupportedFrameworks(NuspecReader nuspecReader, IList<string> packageFiles)
         {
-            return package.GetSupportedFrameworks();
+            var supportedTFMs = Enumerable.Empty<NuGetFramework>();
+            if (packageFiles != null && packageFiles.Any() && nuspecReader != null)
+            {
+                try
+                {
+                    var items = new ContentItemCollection();
+                    items.Load(packageFiles);
+                    var runtimeGraph = new RuntimeGraph();
+                    var conventions = new ManagedCodeConventions(runtimeGraph);
+
+                    var patterns = new[]
+                    {
+                        conventions.Patterns.CompileRefAssemblies,
+                        conventions.Patterns.CompileLibAssemblies,
+                        conventions.Patterns.RuntimeAssemblies,
+                        conventions.Patterns.ContentFiles,
+                        conventions.Patterns.ResourceAssemblies,
+                    };
+
+                    var msbuildPatterns = new[]
+                    {
+                        conventions.Patterns.MSBuildTransitiveFiles,
+                        conventions.Patterns.MSBuildFiles,
+                        conventions.Patterns.MSBuildMultiTargetingFiles,
+                    };
+
+                    var groups = patterns
+                        .SelectMany(p => items.FindItemGroups(p));
+
+                    // Filter out MSBuild assets that don't match the package ID.
+                    var packageId = nuspecReader.GetId();
+                    var msbuildGroups = msbuildPatterns
+                        .SelectMany(p => items.FindItemGroups(p))
+                        .Where(g => HasBuildItemsForPackageId(g.Items, packageId));
+
+                    supportedTFMs = groups
+                        .Concat(msbuildGroups)
+                        .SelectMany(p => p.Properties)
+                        .Where(pair => pair.Key == ManagedCodeConventions.PropertyNames.TargetFrameworkMoniker)
+                        .Select(pair => pair.Value)
+                        .Cast<NuGetFramework>()
+                        .Distinct();
+                }
+                catch (Exception)
+                {
+                    // fail silently without providing a value
+                }
+            }
+
+            return supportedTFMs;
+        }
+
+        private static bool HasBuildItemsForPackageId(IEnumerable<ContentItem> items, string packageId)
+        {
+            foreach (var item in items)
+            {
+                var fileName = Path.GetFileName(item.Path);
+                if (fileName == PackagingCoreConstants.EmptyFolder)
+                {
+                    return true;
+                }
+
+                if ($"{packageId}.props".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if ($"{packageId}.targets".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static EmbeddedLicenseFileType GetEmbeddedLicenseType(PackageMetadata packageMetadata)
